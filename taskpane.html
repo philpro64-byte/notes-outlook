@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="fr"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes privées</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<style>
+:root{--bg:#fff;--fg:#242424;--mut:#707070;--bd:#d1d1d1;--ac:#5b5fc7;--acbg:#e8ebfa}
+@media (prefers-color-scheme:dark){:root{--bg:#1f1f1f;--fg:#f0f0f0;--mut:#a0a0a0;--bd:#444;--ac:#a6a9f0;--acbg:#2b2d4d}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px;font:14px "Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:16px 0 6px}
+h2:first-child{margin-top:0}
+textarea,input{width:100%;font:inherit;color:inherit;background:transparent;border:1px solid var(--bd);border-radius:6px;padding:8px}
+textarea{min-height:130px;resize:vertical}
+textarea:focus,input:focus{outline:2px solid var(--ac);border-color:transparent}
+.row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+button{font:inherit;color:inherit;background:transparent;border:1px solid var(--bd);border-radius:999px;padding:5px 11px;cursor:pointer}
+button:hover{border-color:var(--ac)}
+button.on{background:var(--acbg);border-color:var(--ac);color:var(--ac);font-weight:600}
+button.primary{background:var(--ac);color:var(--bg);border-color:var(--ac);border-radius:6px}
+label{font-size:12px;color:var(--mut)}
+.hint{font-size:12px;color:var(--mut);margin-top:4px;min-height:16px}
+.due{color:#c4314b;font-weight:600}
+</style></head>
+<body>
+<h2>Commentaire privé</h2>
+<textarea id="note" placeholder="Visible uniquement par vous…"></textarea>
+<div class="row" style="margin-top:6px">
+  <button id="voice">🎙 Mémo vocal</button>
+  <label><input type="checkbox" id="full" checked style="width:auto"> inclure la transcription</label>
+</div>
+<div class="hint" id="noteHint"></div>
+
+<h2>Flags perso</h2>
+<div class="row" id="flags"></div>
+
+<h2>Rappel</h2>
+<div class="row">
+  <button data-q="h1">Dans 1 h</button><button data-q="tom">Demain 9 h</button>
+  <button data-q="mon">Lundi 9 h</button><button data-q="w1">Dans 1 sem.</button>
+</div>
+<input type="datetime-local" id="when" style="margin-top:8px">
+<div class="row" style="margin-top:8px">
+  <button class="primary" id="setR">Programmer</button>
+  <button id="clearR">Effacer</button>
+</div>
+<div class="hint" id="remHint"></div>
+
+<script>
+const FLAGS=["⭐ Perso – Important","⏳ Perso – À suivre","💬 Perso – À répondre","📌 Perso – À garder","🔒 Perso – Confidentiel"];
+let item=null,props=null,timer=null;
+const $=id=>document.getElementById(id);
+const pad=n=>String(n).padStart(2,"0");
+const toLocal=d=>`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+Office.onReady(()=>{
+  ensureMaster();
+  Office.context.mailbox.addHandlerAsync(Office.EventType.ItemChanged,load);
+  $("note").addEventListener("input",()=>{clearTimeout(timer);$("noteHint").textContent="…";timer=setTimeout(saveNote,600)});
+  document.querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>quick(b.dataset.q));
+  $("setR").onclick=setReminder;$("clearR").onclick=clearReminder;$("voice").onclick=openVoice;
+  load();
+});
+function load(){
+  item=Office.context.mailbox.item;if(!item)return;
+  item.loadCustomPropertiesAsync(r=>{
+    if(r.status!==Office.AsyncResultStatus.Succeeded){$("noteHint").textContent="Erreur de chargement";return}
+    props=r.value;$("note").value=props.get("note")||"";$("noteHint").textContent="";renderReminder();
+  });
+  renderFlags();
+}
+
+/* ---------- Commentaire ---------- */
+function saveNote(){
+  if(!props)return;const v=$("note").value;
+  v?props.set("note",v):props.remove("note");
+  props.saveAsync(r=>{$("noteHint").textContent=r.status===Office.AsyncResultStatus.Succeeded?"Enregistré ✓":"Échec de l’enregistrement"});
+}
+
+/* ---------- Mémo vocal : dictée (dialogue) + synthèse locale ---------- */
+function openVoice(){
+  Office.context.ui.displayDialogAsync(new URL("dictee.html",location.href).href,{height:60,width:35,displayInIframe:false},r=>{
+    if(r.status!==Office.AsyncResultStatus.Succeeded){$("noteHint").textContent="Dialogue impossible : "+r.error.message;return}
+    const d=r.value;
+    d.addEventHandler(Office.EventType.DialogMessageReceived,a=>{
+      d.close();
+      const {segs}=JSON.parse(a.message);
+      if(!segs||!segs.length)return;
+      insertMemo(segs);
+    });
+  });
+}
+const STOP=new Set(("le la les un une des de du d l et ou mais donc or ni car que qui quoi dont ou je j tu il elle on nous vous ils elles me m te t se s ce c cet cette ces mon ma mes ton ta tes son sa ses notre votre leur leurs a au aux en dans par pour sur avec sans sous est es sont suis etre ete ai as avons avez ont avoir y ne n pas plus tres aussi alors bon ben euh voila comme si fait faire dit qu").split(" "));
+const norm=s=>s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"");
+const words=s=>(norm(s).match(/[a-z0-9]{3,}/g)||[]).filter(w=>!STOP.has(w));
+function summarize(segs,max=3){
+  if(segs.length<=max)return segs;
+  const freq={};segs.forEach(s=>words(s).forEach(w=>freq[w]=(freq[w]||0)+1));
+  const scored=segs.map((s,i)=>{const w=words(s);return{i,s,sc:w.reduce((a,x)=>a+freq[x],0)/Math.sqrt(w.length||1)}});
+  return scored.sort((a,b)=>b.sc-a.sc).slice(0,max).sort((a,b)=>a.i-b.i).map(x=>x.s);
+}
+const ACTION=/(rappel|appel|envoy|relanc|prevoir|penser a|il faut|dois|doit|devr|verifi|confirm|demand|valid|planifi|organis|repond|transmett|oublie|avant (lundi|mardi|mercredi|jeudi|vendredi|demain)|demain|semaine prochaine)/;
+function insertMemo(segs){
+  const cap=s=>s.charAt(0).toUpperCase()+s.slice(1);
+  const when=new Date().toLocaleString("fr-FR",{dateStyle:"short",timeStyle:"short"});
+  const actions=segs.filter(s=>ACTION.test(norm(s)));
+  let t=`🎙 Mémo du ${when}\nSynthèse :\n`+summarize(segs).map(s=>"• "+cap(s)).join("\n");
+  if(actions.length)t+="\nÀ faire :\n"+actions.map(s=>"☐ "+cap(s)).join("\n");
+  if($("full").checked)t+="\nTranscription :\n"+segs.map(cap).join(". ")+".";
+  const ta=$("note");ta.value=(ta.value?ta.value+"\n\n":"")+t;saveNote();
+}
+
+/* ---------- Flags (catégories Outlook) ---------- */
+function ensureMaster(){
+  const mc=Office.context.mailbox.masterCategories;if(!mc)return;
+  mc.getAsync(r=>{
+    const have=(r.value||[]).map(c=>c.displayName);
+    const miss=FLAGS.filter(f=>!have.includes(f)).map((f,i)=>({displayName:f,color:Office.MailboxEnums.CategoryColor["Preset"+(i+7)]}));
+    if(miss.length)mc.addAsync(miss,()=>{});
+  });
+}
+function renderFlags(){
+  item.categories.getAsync(r=>{
+    const cur=(r.value||[]).map(c=>c.displayName),box=$("flags");box.innerHTML="";
+    FLAGS.forEach(f=>{
+      const b=document.createElement("button");b.textContent=f.replace(" Perso – "," ");
+      if(cur.includes(f))b.className="on";
+      b.onclick=()=>{const fn=cur.includes(f)?item.categories.removeAsync:item.categories.addAsync;fn.call(item.categories,[f],renderFlags)};
+      box.appendChild(b);
+    });
+  });
+}
+
+/* ---------- Rappel ---------- */
+function quick(k){
+  const d=new Date();
+  if(k==="h1")d.setHours(d.getHours()+1);
+  else if(k==="w1"){d.setDate(d.getDate()+7);d.setHours(9,0,0,0)}
+  else if(k==="tom"){d.setDate(d.getDate()+1);d.setHours(9,0,0,0)}
+  else{d.setDate(d.getDate()+((8-d.getDay())%7||7));d.setHours(9,0,0,0)}
+  d.setSeconds(0,0);$("when").value=toLocal(d);
+}
+function setReminder(){
+  const v=$("when").value;if(!v||!props){$("remHint").textContent="Choisissez une date.";return}
+  const start=new Date(v);
+  props.set("remind",start.toISOString());
+  props.saveAsync(()=>{
+    renderReminder();
+    let link="";
+    try{const rid=Office.context.mailbox.convertToRestId(item.itemId,Office.MailboxEnums.RestVersion.v2_0);
+      link="https://outlook.office.com/owa/?ItemID="+encodeURIComponent(rid)+"&exvsurl=1&viewmodel=ReadMessageItem"}catch(e){}
+    Office.context.mailbox.displayNewAppointmentFormAsync({
+      subject:"Rappel : "+item.subject,start,end:new Date(start.getTime()+15*60000),
+      body:"Mail : "+(link||item.subject)+"\n\n"+$("note").value
+    });
+  });
+}
+function clearReminder(){
+  if(!props)return;props.remove("remind");
+  props.saveAsync(()=>{$("when").value="";renderReminder()});
+}
+function renderReminder(){
+  const iso=props&&props.get("remind"),h=$("remHint");
+  if(!iso){h.textContent="Aucun rappel.";return}
+  const d=new Date(iso),late=d<new Date();h.innerHTML="";
+  const s=document.createElement("span");if(late)s.className="due";
+  s.textContent=(late?"En retard : ":"Rappel : ")+d.toLocaleString("fr-FR",{dateStyle:"full",timeStyle:"short"});
+  h.appendChild(s);$("when").value=toLocal(d);
+}
+</script>
+</body></html>
